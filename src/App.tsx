@@ -210,6 +210,11 @@ interface PaginationConfig {
   totalItems: number;
 }
 
+// Helper for rounding to 2 decimal places for consistent calculations
+const roundToTwo = (num: number): number => {
+  return Math.round((num + Number.EPSILON) * 100) / 100;
+};
+
 // Helper for formatting currency
 const formatCurrency = (amount: number): string => {
   return new Intl.NumberFormat("es-MX", {
@@ -388,14 +393,6 @@ const getRegimenFiscalText = (regimenFiscal: string): string => {
   return regimenesFiscales[regimenFiscal] || regimenFiscal;
 };
 
-// Format amount based on tipo comprobante
-const formatAmountByTipo = (amount: number, tipo: string): string => {
-  if (tipo === "E") {
-    return `-${formatCurrency(Math.abs(amount))}`;
-  }
-  return formatCurrency(amount);
-};
-
 // Get month name from number
 const getMonthName = (monthNum: string): string => {
   const months = [
@@ -421,7 +418,6 @@ const calculateDisplayValues = (
 ): InvoiceDataParsed => {
   const tipo = invoice.comprobante.tipoComprobante;
   const isEgreso = tipo === "E";
-  const prefix = isEgreso ? "-" : "";
 
   const displayValues = {
     total: isEgreso
@@ -433,7 +429,7 @@ const calculateDisplayValues = (
     impuestos: isEgreso
       ? -Math.abs(invoice.impuestos.totalImpuestosTrasladados)
       : invoice.impuestos.totalImpuestosTrasladados,
-    prefix,
+    prefix: isEgreso ? "-" : "",
   };
 
   return {
@@ -454,6 +450,8 @@ const App = () => {
 
   const [errors, setErrors] = useState<ValidationErrors>({});
   const [xmlFiles, setXmlFiles] = useState<XmlFile[]>([]);
+  const [currentXmlPage, setCurrentXmlPage] = useState<number>(1);
+  const xmlFilesPerPage = 10;
   const [processedData, setProcessedData] = useState<ProcessedData | null>(
     null
   );
@@ -1080,14 +1078,103 @@ const App = () => {
     });
   };
 
-  // Parse XML file contents
   const parseXMLContent = (xmlContent: string): InvoiceDataParsed | null => {
     const parser = new DOMParser();
     const xmlDoc = parser.parseFromString(xmlContent, "text/xml");
 
+    // Helper function to parse numbers correctly
+    const parseNumberSafely = (value: any, defaultValue = 0): number => {
+      if (typeof value === "number") return value;
+      if (typeof value !== "string" || value.trim() === "") return defaultValue;
+
+      const trimmedValue = value.trim();
+
+      // Handle European format (comma as decimal, possibly periods as thousands separators)
+      if (/^-?[\d.,]+$/.test(trimmedValue)) {
+        // If it contains a comma, it's likely European format
+        if (trimmedValue.includes(",")) {
+          // Convert European format to standard format:
+          // First remove all periods (thousands separators)
+          // Then replace comma with period for decimal point
+          const normalized = trimmedValue.replace(/\./g, "").replace(",", ".");
+
+          const result = parseFloat(normalized);
+          if (!isNaN(result)) {
+            return result;
+          }
+        }
+      }
+
+      // Try standard parsing
+      const result = parseFloat(trimmedValue);
+      return !isNaN(result) ? result : defaultValue;
+    };
+
     try {
       // Extract main invoice data
       const comprobante = xmlDoc.getElementsByTagName("cfdi:Comprobante")[0];
+
+      if (!comprobante) {
+        console.error("Missing required XML elements");
+        return null;
+      }
+
+      // FIRST: Check for problematic payment vouchers and skip them
+      const tipoComprobante =
+        comprobante.getAttribute("TipoDeComprobante") || "";
+      const moneda = comprobante.getAttribute("Moneda") || "";
+
+      // Check if it's a payment voucher with XXX currency and zero totals
+      if (
+        tipoComprobante === "P" &&
+        comprobante.getAttribute("SubTotal") === "0" &&
+        moneda === "XXX" &&
+        comprobante.getAttribute("Total") === "0"
+      ) {
+        // Look for exempt tax factor
+        const hasExemptTaxFactor = xmlDoc.querySelector(
+          "[TipoFactorP='Exento'], [TipoFactorDR='Exento']"
+        );
+
+        // Check for large payment amounts
+        const pagos = xmlDoc.getElementsByTagName("pago20:Pagos")[0];
+        if (pagos && hasExemptTaxFactor) {
+          const doctoRelacionado = xmlDoc.querySelector(
+            "pago20:DoctoRelacionado"
+          );
+          if (doctoRelacionado) {
+            const impSaldoAnt = parseNumberSafely(
+              doctoRelacionado.getAttribute("ImpSaldoAnt") || "0"
+            );
+            const impPagado = parseNumberSafely(
+              doctoRelacionado.getAttribute("ImpPagado") || "0"
+            );
+
+            // If it has large payment amounts and exempt tax factor, skip this file
+            if (impSaldoAnt > 100000 && impPagado > 100000) {
+              console.warn(
+                "Skipping problematic payment XML with exempt tax and large amounts"
+              );
+              return null;
+            }
+          }
+
+          // Additional check: Look for TotalTrasladosBaseIVAExento with large values
+          const totales = pagos.getElementsByTagName("pago20:Totales")[0];
+          if (totales) {
+            const exemptBase = parseNumberSafely(
+              totales.getAttribute("TotalTrasladosBaseIVAExento") || "0"
+            );
+            if (exemptBase > 100000) {
+              console.warn(
+                "Skipping problematic payment XML with large exempt base amount"
+              );
+              return null;
+            }
+          }
+        }
+      }
+
       const emisor = xmlDoc.getElementsByTagName("cfdi:Emisor")[0];
       const receptor = xmlDoc.getElementsByTagName("cfdi:Receptor")[0];
       const conceptos = xmlDoc.getElementsByTagName("cfdi:Conceptos")[0];
@@ -1095,7 +1182,7 @@ const App = () => {
         "tfd:TimbreFiscalDigital"
       )[0];
 
-      if (!comprobante || !emisor || !receptor || !conceptos) {
+      if (!emisor || !receptor || !conceptos) {
         console.error("Missing required XML elements");
         return null;
       }
@@ -1104,69 +1191,243 @@ const App = () => {
       const fecha = comprobante.getAttribute("Fecha") || "";
       const serie = comprobante.getAttribute("Serie") || "";
       const folio = comprobante.getAttribute("Folio") || "";
-      const tipoComprobante =
-        comprobante.getAttribute("TipoDeComprobante") || "";
-      const moneda = comprobante.getAttribute("Moneda") || "MXN";
-      const tipoCambio = parseFloat(
-        comprobante.getAttribute("TipoCambio") || "1"
+      const tipoCambio = parseNumberSafely(
+        comprobante.getAttribute("TipoCambio") || "1",
+        1
       );
       const exportacion = comprobante.getAttribute("Exportacion") || "";
 
       // Check if it's a payment voucher (type P)
       const isPaymentVoucher = tipoComprobante === "P";
 
-      let total = 0;
-      let subTotal = 0;
+      // Initialize variables for amounts
+      let totalAmount = 0;
+      let subTotalAmount = 0;
       let totalImpuestosTrasladados = 0;
 
       if (isPaymentVoucher) {
+        // Default values from Comprobante
+        totalAmount = parseNumberSafely(
+          comprobante.getAttribute("Total") || "0"
+        );
+        subTotalAmount = parseNumberSafely(
+          comprobante.getAttribute("SubTotal") || "0"
+        );
+
         // Look for the Pagos element
         const pagos = xmlDoc.getElementsByTagName("pago20:Pagos")[0];
         if (pagos) {
+          // First, determine if this is a tax-exempt payment
+          // Check for TipoFactorDR="Exento" in any DoctoRelacionado
+          let hasExemptTax = false;
+
+          // Look for explicit exempt tax indicators
+          const exemptFactorElement = xmlDoc.querySelector(
+            "[TipoFactorDR='Exento'], [TipoFactorP='Exento']"
+          );
+          if (exemptFactorElement) {
+            hasExemptTax = true;
+          }
+
           const totales = pagos.getElementsByTagName("pago20:Totales")[0];
           if (totales) {
-            // Extract the values from pago20:Totales
-            subTotal = parseFloat(
-              totales.getAttribute("TotalTrasladosBaseIVA16") || "0"
-            );
-            totalImpuestosTrasladados = parseFloat(
-              totales.getAttribute("TotalTrasladosImpuestoIVA16") || "0"
-            );
-            total = parseFloat(totales.getAttribute("MontoTotalPagos") || "0");
-          } else {
-            // If no Totales element found, try to calculate from Pago elements
-            const pagoElements = pagos.getElementsByTagName("pago20:Pago");
-            for (let i = 0; i < pagoElements.length; i++) {
-              const pago = pagoElements[i];
-              total += parseFloat(pago.getAttribute("Monto") || "0");
+            // Also check for TotalTrasladosBaseIVAExento attribute
+            if (totales.getAttribute("TotalTrasladosBaseIVAExento") !== null) {
+              hasExemptTax = true;
+            }
 
-              // Try to get tax information from ImpuestosP if available
-              const impuestosP =
-                pago.getElementsByTagName("pago20:ImpuestosP")[0];
-              if (impuestosP) {
-                const trasladosP =
-                  impuestosP.getElementsByTagName("pago20:TrasladosP")[0];
-                if (trasladosP) {
-                  const trasladoElements =
-                    trasladosP.getElementsByTagName("pago20:TrasladoP");
-                  for (let j = 0; j < trasladoElements.length; j++) {
-                    const traslado = trasladoElements[j];
-                    subTotal += parseFloat(
-                      traslado.getAttribute("BaseP") || "0"
+            const montoTotalPagos = parseNumberSafely(
+              totales.getAttribute("MontoTotalPagos") || "0"
+            );
+            if (montoTotalPagos > 0) {
+              totalAmount = montoTotalPagos;
+
+              if (hasExemptTax) {
+                // For tax-exempt payments, subtotal equals total and taxes are 0
+                subTotalAmount = totalAmount;
+                totalImpuestosTrasladados = 0;
+              } else {
+                // For payments with tax, look for base and tax amounts
+                const baseIVA16 = parseNumberSafely(
+                  totales.getAttribute("TotalTrasladosBaseIVA16") || "0"
+                );
+                const baseIVA8 = parseNumberSafely(
+                  totales.getAttribute("TotalTrasladosBaseIVA8") || "0"
+                );
+                const baseIVA0 = parseNumberSafely(
+                  totales.getAttribute("TotalTrasladosBaseIVA0") || "0"
+                );
+                const totalBase = baseIVA16 + baseIVA8 + baseIVA0;
+
+                // If we found any tax base, use it for subtotal
+                if (totalBase > 0) {
+                  subTotalAmount = totalBase;
+                  // Get tax amounts
+                  const impuestoIVA16 = parseNumberSafely(
+                    totales.getAttribute("TotalTrasladosImpuestoIVA16") || "0"
+                  );
+                  const impuestoIVA8 = parseNumberSafely(
+                    totales.getAttribute("TotalTrasladosImpuestoIVA8") || "0"
+                  );
+                  totalImpuestosTrasladados = impuestoIVA16 + impuestoIVA8;
+                } else {
+                  // No explicit tax base found
+                  // Try to check individual payments
+                  let foundTaxInfo = false;
+                  const pagoElements =
+                    pagos.getElementsByTagName("pago20:Pago");
+                  for (
+                    let i = 0;
+                    i < pagoElements.length && !foundTaxInfo;
+                    i++
+                  ) {
+                    const pago = pagoElements[i];
+                    const doctoRelacionados = pago.getElementsByTagName(
+                      "pago20:DoctoRelacionado"
                     );
-                    totalImpuestosTrasladados += parseFloat(
-                      traslado.getAttribute("ImporteP") || "0"
-                    );
+
+                    for (
+                      let j = 0;
+                      j < doctoRelacionados.length && !foundTaxInfo;
+                      j++
+                    ) {
+                      const docto = doctoRelacionados[j];
+                      const impuestosDR =
+                        docto.getElementsByTagName("pago20:ImpuestosDR")[0];
+
+                      if (impuestosDR) {
+                        const trasladosDR =
+                          impuestosDR.getElementsByTagName(
+                            "pago20:TrasladosDR"
+                          )[0];
+                        if (trasladosDR) {
+                          const trasladoDRs =
+                            trasladosDR.getElementsByTagName(
+                              "pago20:TrasladoDR"
+                            );
+                          for (let k = 0; k < trasladoDRs.length; k++) {
+                            const trasladoDR = trasladoDRs[k];
+                            const tipoFactorDR =
+                              trasladoDR.getAttribute("TipoFactorDR");
+
+                            if (tipoFactorDR === "Tasa") {
+                              // Found a tax rate specification
+                              const baseDR = parseNumberSafely(
+                                trasladoDR.getAttribute("BaseDR") || "0"
+                              );
+                              const importeDR = parseNumberSafely(
+                                trasladoDR.getAttribute("ImporteDR") || "0"
+                              );
+
+                              if (baseDR > 0) {
+                                subTotalAmount = baseDR;
+                                totalImpuestosTrasladados = importeDR;
+                                foundTaxInfo = true;
+                                break;
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+
+                  // If we still have no tax info, assume subtotal = total, no taxes
+                  if (!foundTaxInfo) {
+                    subTotalAmount = totalAmount;
+                    totalImpuestosTrasladados = 0;
                   }
                 }
               }
             }
+          } else {
+            // If no Totales element, calculate from Pago elements
+            const pagoElements = pagos.getElementsByTagName("pago20:Pago");
+            let totalMonto = 0;
+
+            for (let i = 0; i < pagoElements.length; i++) {
+              const pago = pagoElements[i];
+              const montoAttr = pago.getAttribute("Monto");
+              totalMonto += parseNumberSafely(montoAttr || "0");
+            }
+
+            if (totalMonto > 0) {
+              totalAmount = totalMonto;
+
+              if (hasExemptTax) {
+                // For tax-exempt payments, subtotal equals total and taxes are 0
+                subTotalAmount = totalAmount;
+                totalImpuestosTrasladados = 0;
+              } else {
+                // Try to extract tax information from ImpuestosP
+                let totalBase = 0;
+                let totalTax = 0;
+                let foundTaxInfo = false;
+
+                for (let i = 0; i < pagoElements.length; i++) {
+                  const pago = pagoElements[i];
+                  const impuestosP =
+                    pago.getElementsByTagName("pago20:ImpuestosP")[0];
+
+                  if (impuestosP) {
+                    const trasladosP =
+                      impuestosP.getElementsByTagName("pago20:TrasladosP")[0];
+                    if (trasladosP) {
+                      const trasladoElements =
+                        trasladosP.getElementsByTagName("pago20:TrasladoP");
+                      for (let j = 0; j < trasladoElements.length; j++) {
+                        const traslado = trasladoElements[j];
+                        const tipoFactorP =
+                          traslado.getAttribute("TipoFactorP");
+
+                        if (tipoFactorP !== "Exento") {
+                          foundTaxInfo = true;
+                          const baseP = parseNumberSafely(
+                            traslado.getAttribute("BaseP") || "0"
+                          );
+                          const importeP = parseNumberSafely(
+                            traslado.getAttribute("ImporteP") || "0"
+                          );
+                          totalBase += baseP;
+                          totalTax += importeP;
+                        }
+                      }
+                    }
+                  }
+                }
+
+                if (foundTaxInfo && totalBase > 0) {
+                  subTotalAmount = totalBase;
+                  totalImpuestosTrasladados = totalTax;
+                } else {
+                  // No tax info found, assume subtotal = total, no taxes
+                  subTotalAmount = totalAmount;
+                  totalImpuestosTrasladados = 0;
+                }
+              }
+            }
+          }
+
+          // Final safety checks for payment vouchers
+          if (hasExemptTax) {
+            // For tax-exempt payments, always ensure taxes are 0
+            totalImpuestosTrasladados = 0;
+            subTotalAmount = totalAmount;
+          }
+
+          // If the difference between subtotal and total is very small, assume no taxes
+          if (Math.abs(subTotalAmount - totalAmount) < 0.01) {
+            totalImpuestosTrasladados = 0;
           }
         }
       } else {
         // Regular invoice (not payment)
-        total = parseFloat(comprobante.getAttribute("Total") || "0");
-        subTotal = parseFloat(comprobante.getAttribute("SubTotal") || "0");
+        totalAmount = parseNumberSafely(
+          comprobante.getAttribute("Total") || "0"
+        );
+        subTotalAmount = parseNumberSafely(
+          comprobante.getAttribute("SubTotal") || "0"
+        );
 
         // Calculate tax information from impuestos node
         const impuestosNode = xmlDoc.getElementsByTagName("cfdi:Impuestos")[0];
@@ -1175,7 +1436,7 @@ const App = () => {
             "TotalImpuestosTrasladados"
           );
           if (totalImpTransAttr) {
-            totalImpuestosTrasladados = parseFloat(totalImpTransAttr);
+            totalImpuestosTrasladados = parseNumberSafely(totalImpTransAttr);
           } else {
             // If not specified directly, use traslados if available
             const trasladosNodes =
@@ -1185,30 +1446,56 @@ const App = () => {
                 trasladosNodes.getElementsByTagName("cfdi:Traslado");
               for (let i = 0; i < trasladoElements.length; i++) {
                 const traslado = trasladoElements[i];
-                totalImpuestosTrasladados += parseFloat(
-                  traslado.getAttribute("Importe") || "0"
-                );
+                // Check if this is an exempt tax
+                const tipoFactor = traslado.getAttribute("TipoFactor") || "";
+                if (tipoFactor !== "Exento") {
+                  totalImpuestosTrasladados += parseNumberSafely(
+                    traslado.getAttribute("Importe") || "0"
+                  );
+                }
               }
             }
           }
         }
+
+        // Round values
+        totalAmount = roundToTwo(totalAmount);
+        subTotalAmount = roundToTwo(subTotalAmount);
+        totalImpuestosTrasladados = roundToTwo(totalImpuestosTrasladados);
       }
 
       // If tax information is still not available, calculate from total and subtotal
-      if (totalImpuestosTrasladados === 0 && total > 0 && subTotal > 0) {
-        totalImpuestosTrasladados = total - subTotal;
+      // Only if we don't have exempt taxes
+      const hasExemptTax = xmlDoc.querySelector(
+        "[TipoFactor='Exento'], [TipoFactorP='Exento'], [TipoFactorDR='Exento']"
+      );
+
+      if (
+        totalImpuestosTrasladados === 0 &&
+        totalAmount > 0 &&
+        subTotalAmount > 0 &&
+        !hasExemptTax
+      ) {
+        totalImpuestosTrasladados = roundToTwo(totalAmount - subTotalAmount);
       }
 
       // Verify the calculation: subtotal + taxes = total
-      const calculatedTotal = subTotal + totalImpuestosTrasladados;
-      if (Math.abs(calculatedTotal - total) > 0.1) {
+      const calculatedTotal = roundToTwo(
+        subTotalAmount + totalImpuestosTrasladados
+      );
+      if (Math.abs(calculatedTotal - totalAmount) > 0.1 && !hasExemptTax) {
         console.warn("Warning: Tax calculation discrepancy detected", {
-          subTotal,
+          subTotal: subTotalAmount,
           totalImpuestosTrasladados,
-          total,
+          total: totalAmount,
           calculatedTotal,
-          difference: Math.abs(calculatedTotal - total),
+          difference: Math.abs(calculatedTotal - totalAmount),
         });
+
+        // For non-payment CFDIs, if the difference is too large, just calculate taxes from subtotal and total
+        if (!isPaymentVoucher && !hasExemptTax) {
+          totalImpuestosTrasladados = roundToTwo(totalAmount - subTotalAmount);
+        }
       }
 
       // Extract emisor info
@@ -1235,11 +1522,15 @@ const App = () => {
       for (let i = 0; i < conceptElements.length; i++) {
         const concepto = conceptElements[i];
         const descripcion = concepto.getAttribute("Descripcion") || "";
-        const valorUnitario = parseFloat(
+        const valorUnitario = parseNumberSafely(
           concepto.getAttribute("ValorUnitario") || "0"
         );
-        const importe = parseFloat(concepto.getAttribute("Importe") || "0");
-        const cantidad = parseFloat(concepto.getAttribute("Cantidad") || "0");
+        const importe = parseNumberSafely(
+          concepto.getAttribute("Importe") || "0"
+        );
+        const cantidad = parseNumberSafely(
+          concepto.getAttribute("Cantidad") || "0"
+        );
         const claveProdServ = concepto.getAttribute("ClaveProdServ") || "";
         const claveUnidad = concepto.getAttribute("ClaveUnidad") || "";
         const unidad = concepto.getAttribute("Unidad") || "";
@@ -1251,9 +1542,12 @@ const App = () => {
         if (impuestosNode) {
           const traslados = impuestosNode.getElementsByTagName("cfdi:Traslado");
           for (let j = 0; j < traslados.length; j++) {
-            impuestoImporte += parseFloat(
-              traslados[j].getAttribute("Importe") || "0"
-            );
+            const tipoFactor = traslados[j].getAttribute("TipoFactor") || "";
+            if (tipoFactor !== "Exento") {
+              impuestoImporte += parseNumberSafely(
+                traslados[j].getAttribute("Importe") || "0"
+              );
+            }
           }
         }
 
@@ -1320,8 +1614,8 @@ const App = () => {
           domicilioFiscalReceptor,
         },
         comprobante: {
-          total,
-          subTotal,
+          total: totalAmount,
+          subTotal: subTotalAmount,
           formaPago: comprobante.getAttribute("FormaPago") || "",
           metodoPago: comprobante.getAttribute("MetodoPago") || "",
           tipoComprobante,
@@ -1429,37 +1723,45 @@ const App = () => {
           const isIngreso = tipo === "I";
 
           // Ensure consistent calculations between total, subtotal, and taxes
-          const invoiceTotal = invoice.data.comprobante.total;
-          const invoiceSubtotal = invoice.data.comprobante.subTotal;
-          // To maintain the equation total = subtotal + taxes, calculate taxes as the difference
-          const invoiceTaxes = invoiceTotal - invoiceSubtotal;
+          const invoiceTotal = roundToTwo(invoice.data.comprobante.total);
+          const invoiceSubtotal = roundToTwo(invoice.data.comprobante.subTotal);
+          let invoiceTaxes = roundToTwo(
+            invoice.data.impuestos.totalImpuestosTrasladados
+          );
+
+          // For consistency: if there's a discrepancy, recalculate taxes as the difference
+          if (Math.abs(invoiceSubtotal + invoiceTaxes - invoiceTotal) > 0.1) {
+            invoiceTaxes = roundToTwo(invoiceTotal - invoiceSubtotal);
+          }
 
           // Apply sign based on invoice type
           const signMultiplier = isEgreso ? -1 : 1;
-          const amountValue = invoiceTotal * signMultiplier;
-          const subtotalValue = invoiceSubtotal * signMultiplier;
-          const taxesValue = invoiceTaxes * signMultiplier;
+          const amountValue = roundToTwo(invoiceTotal * signMultiplier);
+          const subtotalValue = roundToTwo(invoiceSubtotal * signMultiplier);
+          const taxesValue = roundToTwo(invoiceTaxes * signMultiplier);
 
           // Add to global totals
-          totalAmount += amountValue;
-          totalTaxes += taxesValue;
-          totalSubtotal += subtotalValue;
+          totalAmount = roundToTwo(totalAmount + amountValue);
+          totalTaxes = roundToTwo(totalTaxes + taxesValue);
+          totalSubtotal = roundToTwo(totalSubtotal + subtotalValue);
 
           // Track by invoice type
           if (isIngreso) {
-            ingresosTotal += amountValue;
-            ingresosTaxes += taxesValue;
-            ingresosSubtotal += subtotalValue;
+            ingresosTotal = roundToTwo(ingresosTotal + amountValue);
+            ingresosTaxes = roundToTwo(ingresosTaxes + taxesValue);
+            ingresosSubtotal = roundToTwo(ingresosSubtotal + subtotalValue);
             ingresosCount++;
           } else if (isEgreso) {
-            egresosTotal += Math.abs(amountValue); // Store as positive for display purposes
-            egresosTaxes += Math.abs(taxesValue);
-            egresosSubtotal += Math.abs(subtotalValue);
+            egresosTotal = roundToTwo(egresosTotal + Math.abs(amountValue)); // Store as positive for display purposes
+            egresosTaxes = roundToTwo(egresosTaxes + Math.abs(taxesValue));
+            egresosSubtotal = roundToTwo(
+              egresosSubtotal + Math.abs(subtotalValue)
+            );
             egresosCount++;
           } else if (isPago) {
-            pagosTotal += amountValue;
-            pagosTaxes += taxesValue;
-            pagosSubtotal += subtotalValue;
+            pagosTotal = roundToTwo(pagosTotal + amountValue);
+            pagosTaxes = roundToTwo(pagosTaxes + taxesValue);
+            pagosSubtotal = roundToTwo(pagosSubtotal + subtotalValue);
             pagosCount++;
           }
 
@@ -1486,19 +1788,31 @@ const App = () => {
           }
 
           byMonth[monthKey].count += 1;
-          byMonth[monthKey].total += amountValue;
-          byMonth[monthKey].taxes += taxesValue;
-          byMonth[monthKey].subtotal += subtotalValue;
+          byMonth[monthKey].total = roundToTwo(
+            byMonth[monthKey].total + amountValue
+          );
+          byMonth[monthKey].taxes = roundToTwo(
+            byMonth[monthKey].taxes + taxesValue
+          );
+          byMonth[monthKey].subtotal = roundToTwo(
+            byMonth[monthKey].subtotal + subtotalValue
+          );
 
           // Track by invoice type within month
           if (isIngreso) {
-            byMonth[monthKey].ingresos += amountValue;
+            byMonth[monthKey].ingresos = roundToTwo(
+              byMonth[monthKey].ingresos + amountValue
+            );
             byMonth[monthKey].ingresoCount += 1;
           } else if (isEgreso) {
-            byMonth[monthKey].egresos += Math.abs(amountValue); // Store as positive for display
+            byMonth[monthKey].egresos = roundToTwo(
+              byMonth[monthKey].egresos + Math.abs(amountValue)
+            ); // Store as positive for display
             byMonth[monthKey].egresoCount += 1;
           } else if (isPago) {
-            byMonth[monthKey].pagos += amountValue;
+            byMonth[monthKey].pagos = roundToTwo(
+              byMonth[monthKey].pagos + amountValue
+            );
             byMonth[monthKey].pagoCount += 1;
           } else {
             byMonth[monthKey].otherCount += 1;
@@ -1515,26 +1829,52 @@ const App = () => {
           }
 
           byTipoComprobante[tipo].count += 1;
-          byTipoComprobante[tipo].total += amountValue;
-          byTipoComprobante[tipo].taxes += taxesValue;
-          byTipoComprobante[tipo].subtotal += subtotalValue;
+          byTipoComprobante[tipo].total = roundToTwo(
+            byTipoComprobante[tipo].total + amountValue
+          );
+          byTipoComprobante[tipo].taxes = roundToTwo(
+            byTipoComprobante[tipo].taxes + taxesValue
+          );
+          byTipoComprobante[tipo].subtotal = roundToTwo(
+            byTipoComprobante[tipo].subtotal + subtotalValue
+          );
         });
 
-        // Verification: ensure global totals align with components
-        if (
-          Math.abs(ingresosTotal - egresosTotal + pagosTotal - totalAmount) >
-          0.1
-        ) {
+        // Verify all calculations
+        // Calculate formula: (ingresos + pagos) - egresos = total
+        const calculatedTotal = roundToTwo(
+          ingresosTotal + pagosTotal - egresosTotal
+        );
+
+        // Check if our calculation matches the summed total
+        if (Math.abs(calculatedTotal - totalAmount) > 0.1) {
           console.warn("Warning: Global calculation discrepancy detected", {
             ingresosTotal,
             egresosTotal,
             pagosTotal,
-            calculated: ingresosTotal - egresosTotal + pagosTotal,
+            calculated: calculatedTotal,
             totalAmount,
-            difference: Math.abs(
-              ingresosTotal - egresosTotal + pagosTotal - totalAmount
-            ),
+            difference: Math.abs(calculatedTotal - totalAmount),
           });
+
+          // Adjust the total to match the calculation for consistency
+          totalAmount = calculatedTotal;
+        }
+
+        // Verify tax calculation: totalSubtotal + totalTaxes = totalAmount
+        const calculatedTotalWithTax = roundToTwo(totalSubtotal + totalTaxes);
+
+        if (Math.abs(calculatedTotalWithTax - totalAmount) > 0.1) {
+          console.warn("Warning: Tax calculation discrepancy detected", {
+            totalSubtotal,
+            totalTaxes,
+            calculated: calculatedTotalWithTax,
+            totalAmount,
+            difference: Math.abs(calculatedTotalWithTax - totalAmount),
+          });
+
+          // Adjust taxes to match total - subtotal
+          totalTaxes = roundToTwo(totalAmount - totalSubtotal);
         }
 
         // Set the processed data
@@ -1611,8 +1951,8 @@ const App = () => {
         // Create workbook
         const wb = XLSX.utils.book_new();
 
-        // Create summary worksheet
-        const summaryData = [
+        // Create summary worksheet with type assertions to fix TS errors
+        const summaryData: any[][] = [
           ["Reporte de Facturas CFDI"],
           ["Fecha de generación", new Date().toLocaleString("es-MX")],
           [
@@ -1633,29 +1973,20 @@ const App = () => {
           ],
           [""],
           ["Resumen de Facturas"],
-          ["Total de Facturas", processedData.summary.invoiceCount.toString()],
-          [
-            "Facturas de Ingreso",
-            processedData.summary.ingresosCount.toString(),
-          ],
-          ["Facturas de Egreso", processedData.summary.egresosCount.toString()],
-          ["Comprobantes de Pago", processedData.summary.pagosCount.toString()],
+          ["Total de Facturas", processedData.summary.invoiceCount],
+          ["Facturas de Ingreso", processedData.summary.ingresosCount],
+          ["Facturas de Egreso", processedData.summary.egresosCount],
+          ["Comprobantes de Pago", processedData.summary.pagosCount],
           [""],
           ["Montos Totales"],
-          [
-            "Total de Ingresos",
-            formatCurrency(processedData.summary.ingresosTotal),
-          ],
-          [
-            "Total de Egresos",
-            formatCurrency(processedData.summary.egresosTotal),
-          ],
-          ["Total de Pagos", formatCurrency(processedData.summary.pagosTotal)],
+          ["Total de Ingresos", processedData.summary.ingresosTotal],
+          ["Total de Egresos", processedData.summary.egresosTotal],
+          ["Total de Pagos", processedData.summary.pagosTotal],
           [""],
           ["Balance Final"],
-          ["Subtotal", formatCurrency(processedData.summary.totalSubtotal)],
-          ["Impuestos", formatCurrency(processedData.summary.totalTaxes)],
-          ["Total", formatCurrency(processedData.summary.totalAmount)],
+          ["Subtotal", processedData.summary.totalSubtotal],
+          ["Impuestos", processedData.summary.totalTaxes],
+          ["Total", processedData.summary.totalAmount],
         ];
 
         const summaryWs = XLSX.utils.aoa_to_sheet(summaryData);
@@ -1668,7 +1999,7 @@ const App = () => {
 
         // Monthly data
         if (processedData.summary.byMonth) {
-          const monthData = [
+          const monthData: any[][] = [
             [
               "Mes",
               "Cantidad de Facturas",
@@ -1690,14 +2021,15 @@ const App = () => {
             const monthName = getMonthName(monthNum);
             const data = processedData.summary.byMonth[month];
 
+            // Pass numbers directly for Excel
             monthData.push([
               `${monthName} ${year}`,
-              data.count.toString(),
-              formatCurrency(data.ingresos),
-              formatCurrency(data.egresos),
-              formatCurrency(data.pagos),
-              formatCurrency(data.taxes),
-              formatCurrency(data.total),
+              data.count,
+              data.ingresos,
+              data.egresos,
+              data.pagos,
+              data.taxes,
+              data.total,
             ]);
           }
 
@@ -1720,7 +2052,7 @@ const App = () => {
 
         // Invoice type data
         if (processedData.summary.byTipoComprobante) {
-          const tipoData = [
+          const tipoData: any[][] = [
             [
               "Tipo de Comprobante",
               "Cantidad de Facturas",
@@ -1735,10 +2067,10 @@ const App = () => {
           )) {
             tipoData.push([
               `${getTipoComprobanteText(tipo)} (${tipo})`,
-              data.count.toString(),
-              formatCurrency(data.subtotal),
-              formatCurrency(data.taxes),
-              formatCurrency(data.total),
+              data.count,
+              data.subtotal,
+              data.taxes,
+              data.total,
             ]);
           }
 
@@ -1758,7 +2090,7 @@ const App = () => {
         }
 
         // Create detailed invoice worksheet
-        const detailsData = [
+        const detailsData: any[][] = [
           [
             "UUID",
             "Folio",
@@ -1787,7 +2119,18 @@ const App = () => {
         sortedInvoices.forEach((invoice) => {
           const tipo = invoice.data.comprobante.tipoComprobante;
           const isEgreso = tipo === "E";
-          const prefix = isEgreso ? "-" : "";
+
+          const subtotal = isEgreso
+            ? -Math.abs(invoice.data.comprobante.subTotal)
+            : invoice.data.comprobante.subTotal;
+
+          const impuestos = isEgreso
+            ? -Math.abs(invoice.data.impuestos.totalImpuestosTrasladados)
+            : invoice.data.impuestos.totalImpuestosTrasladados;
+
+          const total = isEgreso
+            ? -Math.abs(invoice.data.comprobante.total)
+            : invoice.data.comprobante.total;
 
           detailsData.push([
             invoice.data.uuid,
@@ -1802,13 +2145,9 @@ const App = () => {
             getFormaPagoText(invoice.data.comprobante.formaPago),
             getMetodoPagoText(invoice.data.comprobante.metodoPago),
             getUsoCFDIText(invoice.data.receptor.usoCFDI),
-            `${prefix}${Math.abs(invoice.data.comprobante.subTotal).toFixed(
-              2
-            )}`,
-            `${prefix}${Math.abs(
-              invoice.data.impuestos.totalImpuestosTrasladados
-            ).toFixed(2)}`,
-            `${prefix}${Math.abs(invoice.data.comprobante.total).toFixed(2)}`,
+            subtotal,
+            impuestos,
+            total,
           ]);
         });
 
@@ -1816,7 +2155,7 @@ const App = () => {
         XLSX.utils.book_append_sheet(wb, detailsWs, "Facturas");
 
         // Create concepts worksheet
-        const conceptsData = [
+        const conceptsData: any[][] = [
           [
             "UUID",
             "Fecha",
@@ -1835,9 +2174,16 @@ const App = () => {
         processedData.invoices.forEach((invoice) => {
           const tipo = invoice.data.comprobante.tipoComprobante;
           const isEgreso = tipo === "E";
-          const prefix = isEgreso ? "-" : "";
 
           invoice.data.conceptos.forEach((concepto) => {
+            const importe = isEgreso
+              ? -Math.abs(concepto.importe)
+              : concepto.importe;
+
+            const impuestos = isEgreso
+              ? -Math.abs(concepto.impuestos)
+              : concepto.impuestos;
+
             conceptsData.push([
               invoice.data.uuid,
               invoice.data.fecha,
@@ -1846,10 +2192,10 @@ const App = () => {
               concepto.claveUnidad || "",
               concepto.unidad || "",
               concepto.descripcion,
-              concepto.cantidad.toString(),
-              concepto.valorUnitario.toFixed(2),
-              `${prefix}${Math.abs(concepto.importe).toFixed(2)}`,
-              `${prefix}${Math.abs(concepto.impuestos).toFixed(2)}`,
+              concepto.cantidad,
+              concepto.valorUnitario,
+              importe,
+              impuestos,
             ]);
           });
         });
@@ -1858,9 +2204,7 @@ const App = () => {
         XLSX.utils.book_append_sheet(wb, conceptsWs, "Conceptos");
 
         // Save file
-        const fileName = `Reporte_Facturas_CFDI_${
-          new Date().toISOString().split("T")[0]
-        }.xlsx`;
+        const fileName = `Reporte_Facturas_CFDI_${invoiceData.empresaNombre}.xlsx`;
         XLSX.writeFile(wb, fileName);
 
         await new Promise((resolve) => setTimeout(resolve, 500)); // Small delay for animation
@@ -2039,9 +2383,20 @@ const App = () => {
 
         const invoiceTableData = sortedInvoices.map((invoice) => {
           const tipo = invoice.data.comprobante.tipoComprobante;
-          const isEgreso = tipo === "E";
-          const prefix = isEgreso ? "-" : "";
           const tipoText = getTipoComprobanteText(tipo);
+          const isEgreso = tipo === "E";
+
+          const subtotal = isEgreso
+            ? -Math.abs(invoice.data.comprobante.subTotal)
+            : invoice.data.comprobante.subTotal;
+
+          const impuestos = isEgreso
+            ? -Math.abs(invoice.data.impuestos.totalImpuestosTrasladados)
+            : invoice.data.impuestos.totalImpuestosTrasladados;
+
+          const total = isEgreso
+            ? -Math.abs(invoice.data.comprobante.total)
+            : invoice.data.comprobante.total;
 
           return [
             invoice.data.uuid.substring(0, 8) + "...",
@@ -2052,13 +2407,9 @@ const App = () => {
             invoice.data.emisor.nombre.substring(0, 20) +
               (invoice.data.emisor.nombre.length > 20 ? "..." : ""),
             tipoText,
-            `${prefix}${Math.abs(invoice.data.comprobante.subTotal).toFixed(
-              2
-            )}`,
-            `${prefix}${Math.abs(
-              invoice.data.impuestos.totalImpuestosTrasladados
-            ).toFixed(2)}`,
-            `${prefix}${Math.abs(invoice.data.comprobante.total).toFixed(2)}`,
+            formatCurrency(subtotal),
+            formatCurrency(impuestos),
+            formatCurrency(total),
           ];
         });
 
@@ -2111,9 +2462,16 @@ const App = () => {
         sortedInvoices.forEach((invoice) => {
           const tipo = invoice.data.comprobante.tipoComprobante;
           const isEgreso = tipo === "E";
-          const prefix = isEgreso ? "-" : "";
 
           invoice.data.conceptos.forEach((concepto) => {
+            const importe = isEgreso
+              ? -Math.abs(concepto.importe)
+              : concepto.importe;
+
+            const impuestos = isEgreso
+              ? -Math.abs(concepto.impuestos)
+              : concepto.impuestos;
+
             conceptsTableData.push([
               invoice.data.uuid.substring(0, 8) + "...",
               new Date(invoice.data.fecha).toLocaleDateString("es-MX"),
@@ -2121,9 +2479,9 @@ const App = () => {
               concepto.descripcion.substring(0, 40) +
                 (concepto.descripcion.length > 40 ? "..." : ""),
               concepto.cantidad.toString(),
-              concepto.valorUnitario.toFixed(2),
-              `${prefix}${Math.abs(concepto.importe).toFixed(2)}`,
-              `${prefix}${Math.abs(concepto.impuestos).toFixed(2)}`,
+              formatCurrency(concepto.valorUnitario),
+              formatCurrency(importe),
+              formatCurrency(impuestos),
             ]);
           });
         });
@@ -2253,15 +2611,13 @@ const App = () => {
             processedData.summary.byTipoComprobante
           )) {
             const tipoText = getTipoComprobanteText(tipo);
-            const isEgreso = tipo === "E";
-            const prefix = isEgreso ? "-" : "";
 
             tipoData.push([
               `${tipoText} (${tipo})`,
               data.count.toString(),
-              `${prefix}${Math.abs(data.subtotal).toFixed(2)}`,
-              `${prefix}${Math.abs(data.taxes).toFixed(2)}`,
-              `${prefix}${Math.abs(data.total).toFixed(2)}`,
+              formatCurrency(data.subtotal),
+              formatCurrency(data.taxes),
+              formatCurrency(data.total),
             ]);
           }
 
@@ -2318,9 +2674,7 @@ const App = () => {
         }
 
         // Save PDF
-        const fileName = `Reporte_Facturas_CFDI_${
-          new Date().toISOString().split("T")[0]
-        }.pdf`;
+        const fileName = `Reporte_Facturas_CFDI_${invoiceData.empresaNombre}.pdf`;
         doc.save(fileName);
 
         await new Promise((resolve) => setTimeout(resolve, 500)); // Small delay for animation
@@ -2384,6 +2738,16 @@ const App = () => {
       <ChevronDown className="inline-block ml-1 h-4 w-4" />
     );
   };
+
+  const paginatedXmlFiles = useMemo(() => {
+    const startIndex = (currentXmlPage - 1) * xmlFilesPerPage;
+    return xmlFiles.slice(startIndex, startIndex + xmlFilesPerPage);
+  }, [xmlFiles, currentXmlPage]);
+
+  // Calculate total pages
+  const totalXmlPages = useMemo(() => {
+    return Math.ceil(xmlFiles.length / xmlFilesPerPage);
+  }, [xmlFiles.length]);
 
   return (
     <div className="min-h-screen bg-gray-50">
@@ -2720,47 +3084,57 @@ const App = () => {
                     )}
                   </div>
                 </div>
-
-                {xmlFiles.length > 0 && (
-                  <div className="mt-6">
-                    <div className="flex justify-between items-center mb-3">
-                      <h3 className="text-sm font-medium text-gray-900">
-                        Archivos seleccionados ({xmlFiles.length})
-                      </h3>
+                {paginatedXmlFiles.map((file, index) => (
+                  <li
+                    key={index}
+                    className="flex items-center justify-between py-3 pl-3 pr-4 text-sm"
+                  >
+                    <div className="flex items-center flex-1 w-0">
+                      <FileText className="h-5 w-5 text-gray-400 flex-shrink-0" />
+                      <span className="ml-2 flex-1 w-0 truncate">
+                        {file.name}
+                      </span>
+                    </div>
+                    <div className="ml-4 flex-shrink-0">
                       <Button
-                        variant="outline"
+                        variant="ghost"
                         size="sm"
-                        onClick={clearFiles}
+                        onClick={() =>
+                          removeFile(
+                            (currentXmlPage - 1) * xmlFilesPerPage + index
+                          )
+                        }
                         disabled={isProcessing}
                       >
-                        Limpiar todos
+                        <X className="h-4 w-4" />
                       </Button>
                     </div>
-                    <ul className="divide-y divide-gray-100 border rounded-md">
-                      {xmlFiles.map((file, index) => (
-                        <li
-                          key={index}
-                          className="flex items-center justify-between py-3 pl-3 pr-4 text-sm"
-                        >
-                          <div className="flex items-center flex-1 w-0">
-                            <FileText className="h-5 w-5 text-gray-400 flex-shrink-0" />
-                            <span className="ml-2 flex-1 w-0 truncate">
-                              {file.name}
-                            </span>
-                          </div>
-                          <div className="ml-4 flex-shrink-0">
-                            <Button
-                              variant="ghost"
-                              size="sm"
-                              onClick={() => removeFile(index)}
-                              disabled={isProcessing}
-                            >
-                              <X className="h-4 w-4" />
-                            </Button>
-                          </div>
-                        </li>
-                      ))}
-                    </ul>
+                  </li>
+                ))}
+
+                {xmlFiles.length > xmlFilesPerPage && (
+                  <div className="flex items-center justify-between px-4 py-3 bg-white border-t mt-2">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="h-8 px-3"
+                      disabled={currentXmlPage === 1}
+                      onClick={() => setCurrentXmlPage((prev) => prev - 1)}
+                    >
+                      Anterior
+                    </Button>
+                    <span className="text-sm">
+                      Página {currentXmlPage} de {totalXmlPages}
+                    </span>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="h-8 px-3"
+                      disabled={currentXmlPage === totalXmlPages}
+                      onClick={() => setCurrentXmlPage((prev) => prev + 1)}
+                    >
+                      Siguiente
+                    </Button>
                   </div>
                 )}
               </CardContent>
@@ -2865,7 +3239,7 @@ const App = () => {
                         <h3 className="text-lg font-medium text-gray-800 mb-4">
                           Resumen por Tipo de Comprobante
                         </h3>
-                        <div className="overflow-x-auto">
+                        <div className="table-container">
                           <table className="min-w-full divide-y divide-gray-200">
                             <thead className="bg-gray-50">
                               <tr>
@@ -2925,13 +3299,13 @@ const App = () => {
                                       {data.count}
                                     </td>
                                     <td className="px-3 py-2 whitespace-nowrap text-right">
-                                      {formatAmountByTipo(data.subtotal, tipo)}
+                                      {formatCurrency(data.subtotal)}
                                     </td>
                                     <td className="px-3 py-2 whitespace-nowrap text-right">
-                                      {formatAmountByTipo(data.taxes, tipo)}
+                                      {formatCurrency(data.taxes)}
                                     </td>
                                     <td className="px-3 py-2 whitespace-nowrap text-right font-medium">
-                                      {formatAmountByTipo(data.total, tipo)}
+                                      {formatCurrency(data.total)}
                                     </td>
                                   </tr>
                                 ))}
@@ -3034,7 +3408,7 @@ const App = () => {
                           <h3 className="text-lg font-medium text-gray-800 mb-4">
                             Distribución por Mes
                           </h3>
-                          <div className="overflow-x-auto">
+                          <div className="table-container">
                             <table className="min-w-full divide-y divide-gray-200">
                               <thead className="bg-gray-50">
                                 <tr>
@@ -3164,7 +3538,7 @@ const App = () => {
                   </CardHeader>
                   <CardContent>
                     <div className="rounded-md border">
-                      <div className="relative overflow-x-auto">
+                      <div className="table-container">
                         <table className="w-full text-sm text-left text-gray-500">
                           <thead className="text-xs text-gray-700 uppercase bg-gray-50">
                             <tr>
@@ -3422,22 +3796,19 @@ const App = () => {
                                     {getTipoComprobanteBadge(tipo)}
                                   </td>
                                   <td className="px-6 py-3 text-right">
-                                    {formatAmountByTipo(
-                                      invoice.data.comprobante.subTotal,
-                                      tipo
+                                    {formatCurrency(
+                                      invoice.data.comprobante.subTotal
                                     )}
                                   </td>
                                   <td className="px-6 py-3 text-right">
-                                    {formatAmountByTipo(
+                                    {formatCurrency(
                                       invoice.data.impuestos
-                                        .totalImpuestosTrasladados,
-                                      tipo
+                                        .totalImpuestosTrasladados
                                     )}
                                   </td>
                                   <td className="px-6 py-3 text-right font-medium">
-                                    {formatAmountByTipo(
-                                      invoice.data.comprobante.total,
-                                      tipo
+                                    {formatCurrency(
+                                      invoice.data.comprobante.total
                                     )}
                                   </td>
                                 </tr>
@@ -3589,7 +3960,7 @@ const App = () => {
                   </CardHeader>
                   <CardContent>
                     <div className="rounded-md border">
-                      <div className="relative overflow-x-auto">
+                      <div className="table-container">
                         <table className="w-full text-sm text-left text-gray-500">
                           <thead className="text-xs text-gray-700 uppercase bg-gray-50">
                             <tr>
@@ -3854,15 +4225,17 @@ const App = () => {
                                       {formatCurrency(concepto.valorUnitario)}
                                     </td>
                                     <td className="px-6 py-3 text-right">
-                                      {formatAmountByTipo(
-                                        concepto.importe,
-                                        tipo
+                                      {formatCurrency(
+                                        isEgreso
+                                          ? -Math.abs(concepto.importe)
+                                          : concepto.importe
                                       )}
                                     </td>
                                     <td className="px-6 py-3 text-right font-medium">
-                                      {formatAmountByTipo(
-                                        concepto.impuestos,
-                                        tipo
+                                      {formatCurrency(
+                                        isEgreso
+                                          ? -Math.abs(concepto.impuestos)
+                                          : concepto.impuestos
                                       )}
                                     </td>
                                   </tr>
@@ -4233,7 +4606,7 @@ const App = () => {
                             <h3 className="text-sm font-medium text-gray-700 mb-2">
                               Distribución por Periodos
                             </h3>
-                            <div className="overflow-x-auto">
+                            <div className="table-container">
                               <table className="w-full text-sm">
                                 <thead>
                                   <tr className="border-b">
