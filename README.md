@@ -110,19 +110,3 @@ The application correctly handles:
 ```bash
 pnpm run build
 ```
-
-## License
-
-This project is licensed under the MIT License.
-
-## Screenshots
-
-[Add screenshots of the application here if available]
-
-## Contributing
-
-Contributions are welcome! Please open an issue or submit a pull request.
-
-## Support
-
-For support or questions, please open an issue in the repository.
