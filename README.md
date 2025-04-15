@@ -1,5 +1,7 @@
 # XML CFDI Processor
 
+### ⚠️ spaghetti code, ```App.tsx``` needs to be separated into individual components
+
 A React application for processing Mexican CFDI (Comprobante Fiscal Digital por Internet) XML files, extracting financial data, and generating detailed reports.
 
 ## Features
