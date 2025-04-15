@@ -1,54 +1,128 @@
-# React + TypeScript + Vite
+# XML CFDI Processor
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+A React application for processing Mexican CFDI (Comprobante Fiscal Digital por Internet) XML files, extracting financial data, and generating detailed reports.
 
-Currently, two official plugins are available:
+## Features
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react/README.md) uses [Babel](https://babeljs.io/) for Fast Refresh
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react-swc) uses [SWC](https://swc.rs/) for Fast Refresh
+**XML Processing**: Parses CFDI XML files (version 3.3 and 4.0)
+**Data Analysis**:
 
-## Expanding the ESLint configuration
+- Handles different invoice types (Ingreso, Egreso, Pago, Traslado, Nómina)
+- Correctly calculates totals, subtotals, and taxes
+- Distinguishes between income and expense invoices
+  **Reporting**:
+- Generates PDF reports with detailed invoice information
+- Exports data to Excel spreadsheets with multiple worksheets
+- Provides monthly summaries and type-based analysis
+  **User Interface**:
+- Drag and drop file upload
+- Filtering and sorting capabilities
+- Paginated results for large datasets
+- Responsive design
 
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
+## Technologies Used
 
-```js
-export default tseslint.config({
-  extends: [
-    // Remove ...tseslint.configs.recommended and replace with this
-    ...tseslint.configs.recommendedTypeChecked,
-    // Alternatively, use this for stricter rules
-    ...tseslint.configs.strictTypeChecked,
-    // Optionally, add this for stylistic rules
-    ...tseslint.configs.stylisticTypeChecked,
-  ],
-  languageOptions: {
-    // other options...
-    parserOptions: {
-      project: ['./tsconfig.node.json', './tsconfig.app.json'],
-      tsconfigRootDir: import.meta.dirname,
-    },
-  },
-})
+- **Frontend**:
+  - React 19
+- TypeScript
+- Tailwind CSS
+- ShadCN UI components
+- **Libraries**:
+  - jsPDF + AutoTable for PDF generation
+- xlsx for Excel export
+- Sonner for notifications
+- Lucide React for icons
+
+## Installation
+
+1. Clone the repository:
+
+```bash
+git clone https://github.com/brizuela-go/procesador-xml-cfdi.git
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+2. Navigate to the project directory:
+   ```bash
+   cd procesador-de-xml-cfdi
+   ```
+3. Install dependencies:
+   ```bash
+   pnpm install
+   ```
+4. Start the development server:
+   ```bash
+   pnpm run dev
+   ```
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
+## Usage
 
-export default tseslint.config({
-  plugins: {
-    // Add the react-x and react-dom plugins
-    'react-x': reactX,
-    'react-dom': reactDom,
-  },
-  rules: {
-    // other rules...
-    // Enable its recommended typescript rules
-    ...reactX.configs['recommended-typescript'].rules,
-    ...reactDom.configs.recommended.rules,
-  },
-})
+1. **Enter Company Information**:
+
+- Fill in your company's tax information (RFC, business name, tax regime)
+
+2. **Upload XML Files**:
+
+   - Drag and drop CFDI XML files or click to browse
+   - Multiple files can be processed at once
+
+3. **Process Files**:
+
+   - Click "Process Invoices" to analyze the uploaded files
+   - View processing progress in real-time
+
+4. **View Results**:
+
+   - See summary statistics and financial overview
+   - Browse detailed invoice and concept listings
+   - Filter and sort data as needed
+
+5. **Export Reports**:
+   - Generate PDF reports with professional formatting
+   - Export to Excel for further analysis
+   - Reports include:
+     - Executive summary
+     - Monthly breakdowns
+     - Invoice type analysis
+     - Detailed concept listings
+
+## Data Handling
+
+The application correctly handles:
+
+- Different invoice types (I, E, P, T, N)
+- Tax calculations (including special cases for payment vouchers)
+- Currency formatting (MXN)
+- Date ranges and monthly summaries
+- RFC validation
+
+  ## Configuration
+
+  The application can be configured by modifying:
+
+- `src/App.tsx` for main application logic
+- `src/components/ui` for UI components
+- `tailwind.config.js` for styling
+
+  ## Build
+
+  To create a production build:
+
+```bash
+pnpm run build
 ```
+
+## License
+
+This project is licensed under the MIT License.
+
+## Screenshots
+
+[Add screenshots of the application here if available]
+
+## Contributing
+
+Contributions are welcome! Please open an issue or submit a pull request.
+
+## Support
+
+For support or questions, please open an issue in the repository.
